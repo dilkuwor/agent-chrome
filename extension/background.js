@@ -2,6 +2,10 @@ const DEFAULT_PORT = 47321;
 const GRANT_MS = 90000;
 
 const pendingGrants = new Map();
+const cdpSessions = new Set();
+const tabConsoleLogs = new Map();
+const tabNetworkLogs = new Map();
+const tabOpenDialogs = new Map();
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -13,7 +17,7 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 ensureOffscreen();
-chrome.alarms.create("grok-chrome-keepalive", { periodInMinutes: 1 });
+chrome.alarms.create("agent-chrome-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
   ensureOffscreen();
   ensurePolling();
@@ -47,22 +51,145 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  if (message.type === "get-tab-diagnostics") {
+    const tabId = message.tabId;
+    sendResponse({
+      logs: tabConsoleLogs.get(tabId) || [],
+      network: tabNetworkLogs.get(tabId) || [],
+      dialog: tabOpenDialogs.get(tabId) || null,
+      cdpAttached: cdpSessions.has(tabId),
+    });
+    return false;
+  }
 });
+
+// CDP Event Listeners
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId;
+  if (!tabId) return;
+
+  if (method === "Page.javascriptDialogOpening") {
+    tabOpenDialogs.set(tabId, {
+      type: params.type,
+      message: params.message,
+      defaultPrompt: params.defaultPrompt,
+      timestamp: Date.now(),
+    });
+    // Auto-accept simple alerts so the browser tab does not freeze
+    if (params.type === "alert") {
+      chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
+      tabOpenDialogs.delete(tabId);
+    }
+  }
+
+  if (method === "Page.javascriptDialogClosed") {
+    tabOpenDialogs.delete(tabId);
+  }
+
+  if (method === "Runtime.consoleAPICalled") {
+    const list = tabConsoleLogs.get(tabId) || [];
+    const text = (params.args || []).map((arg) => arg.value ?? arg.description ?? JSON.stringify(arg)).join(" ");
+    list.unshift({
+      timestamp: Date.now(),
+      type: params.type || "log",
+      text: text.slice(0, 1000),
+    });
+    if (list.length > 100) list.pop();
+    tabConsoleLogs.set(tabId, list);
+  }
+
+  if (method === "Runtime.exceptionThrown") {
+    const list = tabConsoleLogs.get(tabId) || [];
+    const desc = params.exceptionDetails?.exception?.description || params.exceptionDetails?.text || "Unknown exception";
+    list.unshift({
+      timestamp: Date.now(),
+      type: "error",
+      text: desc.slice(0, 1000),
+    });
+    if (list.length > 100) list.pop();
+    tabConsoleLogs.set(tabId, list);
+  }
+
+  if (method === "Network.responseReceived") {
+    const list = tabNetworkLogs.get(tabId) || [];
+    const res = params.response || {};
+    list.unshift({
+      timestamp: Date.now(),
+      status: res.status,
+      statusText: res.statusText,
+      url: res.url,
+      mimeType: res.mimeType,
+      type: params.type,
+    });
+    if (list.length > 100) list.pop();
+    tabNetworkLogs.set(tabId, list);
+  }
+
+  if (method === "Network.loadingFailed") {
+    const list = tabNetworkLogs.get(tabId) || [];
+    list.unshift({
+      timestamp: Date.now(),
+      status: 0,
+      statusText: "Failed",
+      url: params.requestId,
+      errorText: params.errorText,
+      type: params.type,
+    });
+    if (list.length > 100) list.pop();
+    tabNetworkLogs.set(tabId, list);
+  }
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId) cdpSessions.delete(source.tabId);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  cdpSessions.delete(tabId);
+  tabConsoleLogs.delete(tabId);
+  tabNetworkLogs.delete(tabId);
+  tabOpenDialogs.delete(tabId);
+});
+
+async function attachCdp(tabId) {
+  if (cdpSessions.has(tabId)) return true;
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    cdpSessions.add(tabId);
+    await Promise.allSettled([
+      chrome.debugger.sendCommand({ tabId }, "Page.enable"),
+      chrome.debugger.sendCommand({ tabId }, "Runtime.enable"),
+      chrome.debugger.sendCommand({ tabId }, "Network.enable"),
+      chrome.debugger.sendCommand({ tabId }, "DOM.enable"),
+    ]);
+    return true;
+  } catch (err) {
+    console.warn(`[Agent in Chrome] CDP attach failed on tab ${tabId}: ${err.message}`);
+    return false;
+  }
+}
+
+async function detachCdp(tabId) {
+  if (!cdpSessions.has(tabId)) return;
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {}
+  cdpSessions.delete(tabId);
+}
 
 let bridgeGeneration = 0;
 
 async function ensureOffscreen() {
-  const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
-  if (contexts.length > 0) return;
   try {
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
+    if (contexts.length > 0) return;
     await chrome.offscreen.createDocument({
       url: "offscreen.html",
       reasons: ["WORKERS"],
-      justification: "Hold a localhost connection so Grok and AGY can drive this browser.",
+      justification: "Hold a localhost connection so the AI agent can drive this browser.",
     });
   } catch (error) {
     if (String(error).includes("single offscreen")) return;
-    console.error("offscreen document failed", error);
   }
 }
 
@@ -103,7 +230,7 @@ async function pollLoop(gen) {
       if (response.status === 401) {
         await chrome.storage.local.set({
           bridgeStatus: "bad-token",
-          bridgeDetail: "Token does not match ~/.grok-in-chrome/token",
+          bridgeDetail: "Token does not match pairing token file",
         });
         await sleep(2000);
         continue;
@@ -126,7 +253,7 @@ async function pollLoop(gen) {
       if (gen !== bridgeGeneration) return;
       await chrome.storage.local.set({
         bridgeStatus: "offline",
-        bridgeDetail: "Start a Grok or AGY session, then check that the chrome MCP server is enabled.",
+        bridgeDetail: "Start an agent session, then verify the chrome MCP server is enabled.",
       });
       await sleep(1500);
     }
@@ -154,34 +281,67 @@ async function runTool(tool, args) {
   if (tool === "navigate") return navigate(args);
   if (tool === "screenshot") return screenshot(args);
   if (tool === "run_script") return runScript(args);
+  if (tool === "get_console_logs") return getConsoleLogs(args);
+  if (tool === "get_network_activity") return getNetworkActivity(args);
+  if (tool === "handle_dialog") return handleDialog(args);
+  if (tool === "upload_file") return uploadFile(args);
+
   if (["read_page", "get_page_text", "form_input", "click", "type_text", "press_key", "scroll"].includes(tool)) {
     const tabId = requireTab(args.tabId);
     await assertTabAllowed(tabId);
     await markGroup(tabId);
-    if (["form_input", "click", "type_text", "press_key", "scroll"].includes(tool)) await focusTab(tabId);
+
+    // Auto-attach CDP for robust input & telemetry
+    await attachCdp(tabId);
+
+    if (["form_input", "click", "type_text", "press_key", "scroll"].includes(tool)) {
+      await focusTab(tabId);
+    }
+
+    // Try CDP-powered trusted clicks
+    if (tool === "click") {
+      return clickWithCdp(tabId, args);
+    }
+
+    // Try CDP-powered trusted typing
+    if (tool === "type_text") {
+      return typeWithCdp(tabId, args);
+    }
+
+    // Try CDP-powered trusted keys
+    if (tool === "press_key") {
+      return pressKeyWithCdp(tabId, args);
+    }
+
     const response = await sendToPage(tabId, { type: "page", action: tool, args });
     if (!response?.ok) throw new Error(response?.error || `${tool} failed`);
+
     let text = response.text || "Done.";
-    if (tool === "click" || tool === "press_key") {
-      await sleep(300);
+    if (tool === "form_input") {
       const tab = await chrome.tabs.get(tabId);
       text = `${text}\nURL now: ${tab.url || ""}`;
     }
     return { ok: true, text };
   }
+
   throw new Error(`Unknown tool ${tool}`);
 }
 
 async function tabsContext() {
   const tabs = await chrome.tabs.query({});
-  const lines = tabs.slice(0, 40).map((tab) => {
-    const mark = tab.active ? " active" : "";
-    return `tab ${tab.id} window ${tab.windowId}${mark} ${oneLine(tab.title)} ${tab.url || ""}`;
+  const lines = tabs.map((tab) => {
+    const active = tab.active ? " [active]" : "";
+    const pinned = tab.pinned ? " [pinned]" : "";
+    const status = tab.status ? ` (${tab.status})` : "";
+    return `tab ${tab.id} win ${tab.windowId}${active}${pinned}${status}: "${oneLine(tab.title)}" ${tab.url || ""}`;
   });
-  const extra = tabs.length > 40 ? `\n${tabs.length - 40} more tabs not shown.` : "";
+
   return {
     ok: true,
-    text: `Open tabs (${tabs.length}):\n${lines.join("\n") || "(none)"}${extra}\n\nUse tabs_create unless the user told you to use one of these tabs.`,
+    text:
+      `Open Chrome Tabs (${tabs.length}):\n` +
+      `${lines.join("\n") || "(no open tabs)"}\n\n` +
+      `Tip: Call tabs_create to open a new tab, or use an existing tabId above.`,
   };
 }
 
@@ -191,12 +351,14 @@ async function tabsCreate(args) {
   const tab = await chrome.tabs.create({ url, active: args.active !== false });
   await markGroup(tab.id);
   if (url !== "about:blank") await waitForNavigation(tab.id, url);
+  await attachCdp(tab.id);
   const loaded = await chrome.tabs.get(tab.id);
   return { ok: true, text: `Created tab ${loaded.id}\nTitle: ${loaded.title || ""}\nURL: ${loaded.url || ""}` };
 }
 
 async function tabsClose(args) {
   const tabId = requireTab(args.tabId);
+  await detachCdp(tabId);
   await chrome.tabs.remove(tabId);
   return { ok: true, text: `Closed tab ${tabId}.` };
 }
@@ -209,6 +371,7 @@ async function navigate(args) {
   await focusTab(tabId);
   await chrome.tabs.update(tabId, { url });
   await waitForNavigation(tabId, url);
+  await attachCdp(tabId);
   const tab = await chrome.tabs.get(tabId);
   return { ok: true, text: `Navigated tab ${tab.id}\nTitle: ${tab.title || ""}\nURL: ${tab.url || ""}` };
 }
@@ -219,16 +382,316 @@ async function focusTab(tabId) {
   if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
 }
 
+// Trusted CDP Click
+async function clickWithCdp(tabId, args) {
+  let x = args.x;
+  let y = args.y;
+
+  if (x == null || y == null) {
+    const boundsRes = await sendToPage(tabId, { type: "page", action: "get_element_bounds", args });
+    if (boundsRes?.ok && boundsRes.bounds) {
+      x = boundsRes.bounds.x;
+      y = boundsRes.bounds.y;
+    }
+  }
+
+  if (cdpSessions.has(tabId) && x != null && y != null) {
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: Math.round(x),
+        y: Math.round(y),
+      });
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: Math.round(x),
+        y: Math.round(y),
+        button: "left",
+        clickCount: 1,
+      });
+      await sleep(40);
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: Math.round(x),
+        y: Math.round(y),
+        button: "left",
+        clickCount: 1,
+      });
+
+      await sleep(250);
+      const tab = await chrome.tabs.get(tabId);
+      return {
+        ok: true,
+        text: `Clicked ${args.ref || args.selector || `at (${x}, ${y})`} via trusted native mouse event.\nURL now: ${tab.url || ""}`,
+      };
+    } catch (err) {
+      console.warn(`[Agent in Chrome] CDP click failed, falling back to DOM click: ${err.message}`);
+    }
+  }
+
+  // Fallback to DOM dispatch
+  const res = await sendToPage(tabId, { type: "page", action: "click", args });
+  if (!res?.ok) throw new Error(res?.error || "click failed");
+  await sleep(250);
+  const tab = await chrome.tabs.get(tabId);
+  return { ok: true, text: `${res.text}\nURL now: ${tab.url || ""}` };
+}
+
+// Trusted CDP Typing
+async function typeWithCdp(tabId, args) {
+  const text = String(args.text ?? "");
+  const clear = Boolean(args.clear);
+
+  // Focus element first
+  await sendToPage(tabId, {
+    type: "page",
+    action: "type_text",
+    args: { ...args, text: "" },
+  }).catch(() => {});
+
+  if (cdpSessions.has(tabId)) {
+    try {
+      if (clear) {
+        // Select all and delete
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          key: "a",
+          code: "KeyA",
+          modifiers: 2, // Control or Command
+          windowsVirtualKeyCode: 65,
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+      }
+
+      await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text });
+      return { ok: true, text: `Typed "${text}" via trusted native input into ${args.ref || args.selector || "element"}.` };
+    } catch (err) {
+      console.warn(`[Agent in Chrome] CDP typing failed, falling back: ${err.message}`);
+    }
+  }
+
+  const res = await sendToPage(tabId, { type: "page", action: "type_text", args });
+  if (!res?.ok) throw new Error(res?.error || "type_text failed");
+  return { ok: true, text: res.text };
+}
+
+// Trusted CDP Key Press
+async function pressKeyWithCdp(tabId, args) {
+  const key = String(args.key || "");
+  if (!key) throw new Error("Missing key.");
+
+  let modifiers = 0;
+  if (args.altKey) modifiers |= 1;
+  if (args.ctrlKey) modifiers |= 2;
+  if (args.metaKey) modifiers |= 4;
+  if (args.shiftKey) modifiers |= 8;
+
+  const keyCodes = {
+    Enter: 13,
+    Tab: 9,
+    Escape: 27,
+    Backspace: 8,
+    Delete: 46,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    PageUp: 33,
+    PageDown: 34,
+    Home: 36,
+    End: 35,
+    Space: 32,
+  };
+
+  if (cdpSessions.has(tabId)) {
+    try {
+      const vk = keyCodes[key] || key.toUpperCase().charCodeAt(0) || 0;
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key,
+        code: key,
+        modifiers,
+        windowsVirtualKeyCode: vk,
+      });
+      if (key.length === 1 && !modifiers) {
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "char",
+          text: key,
+          key,
+          code: key,
+          modifiers,
+          windowsVirtualKeyCode: vk,
+        });
+      }
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key,
+        code: key,
+        modifiers,
+        windowsVirtualKeyCode: vk,
+      });
+
+      await sleep(200);
+      const tab = await chrome.tabs.get(tabId);
+      return { ok: true, text: `Pressed key "${key}" via trusted native event.\nURL now: ${tab.url || ""}` };
+    } catch (err) {
+      console.warn(`[Agent in Chrome] CDP press_key failed, falling back: ${err.message}`);
+    }
+  }
+
+  const res = await sendToPage(tabId, { type: "page", action: "press_key", args });
+  if (!res?.ok) throw new Error(res?.error || "press_key failed");
+  await sleep(200);
+  const tab = await chrome.tabs.get(tabId);
+  return { ok: true, text: `${res.text}\nURL now: ${tab.url || ""}` };
+}
+
+// File Upload via CDP
+async function uploadFile(args) {
+  const tabId = requireTab(args.tabId);
+  await assertTabAllowed(tabId);
+  const filePath = String(args.filePath || "");
+  if (!filePath) throw new Error("Missing filePath.");
+
+  await attachCdp(tabId);
+  if (!cdpSessions.has(tabId)) {
+    throw new Error("CDP debugger is required for file uploads.");
+  }
+
+  const selector = args.selector || (args.ref ? `[data-agent-ref="${CSS.escape(args.ref)}"], [data-grok-ref="${CSS.escape(args.ref)}"]` : 'input[type="file"]');
+
+  try {
+    const doc = await chrome.debugger.sendCommand({ tabId }, "DOM.getDocument");
+    const node = await chrome.debugger.sendCommand({ tabId }, "DOM.querySelector", {
+      nodeId: doc.root.nodeId,
+      selector,
+    });
+
+    if (!node || !node.nodeId) {
+      throw new Error(`File input matching ${selector} was not found on the page.`);
+    }
+
+    const desc = await chrome.debugger.sendCommand({ tabId }, "DOM.describeNode", {
+      nodeId: node.nodeId,
+    });
+
+    await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
+      files: [filePath],
+      backendNodeId: desc.node.backendNodeId,
+    });
+
+    return { ok: true, text: `Uploaded file ${filePath} into ${selector}.` };
+  } catch (err) {
+    throw new Error(`File upload failed: ${err.message}`);
+  }
+}
+
+// Dialog Handling via CDP
+async function handleDialog(args) {
+  const tabId = requireTab(args.tabId);
+  await attachCdp(tabId);
+  if (!cdpSessions.has(tabId)) {
+    throw new Error("CDP debugger is required to handle dialogs.");
+  }
+
+  const accept = args.accept !== false;
+  const promptText = args.promptText ? String(args.promptText) : undefined;
+
+  await chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", {
+    accept,
+    promptText,
+  });
+
+  tabOpenDialogs.delete(tabId);
+  return { ok: true, text: `Handled dialog (accepted: ${accept}${promptText ? `, prompt: "${promptText}"` : ""}).` };
+}
+
+// Console logs telemetry
+async function getConsoleLogs(args) {
+  const tabId = requireTab(args.tabId);
+  const logs = tabConsoleLogs.get(tabId) || [];
+  if (args.clear) tabConsoleLogs.set(tabId, []);
+
+  if (!logs.length) {
+    return { ok: true, text: "No console logs recorded on this tab." };
+  }
+
+  const formatted = logs.slice(0, 30).map((item) => {
+    const time = new Date(item.timestamp).toLocaleTimeString();
+    return `[${time}] [${item.type.toUpperCase()}] ${item.text}`;
+  });
+
+  return { ok: true, text: `Console logs for tab ${tabId} (${logs.length}):\n${formatted.join("\n")}` };
+}
+
+// Network activity telemetry
+async function getNetworkActivity(args) {
+  const tabId = requireTab(args.tabId);
+  const records = tabNetworkLogs.get(tabId) || [];
+  if (args.clear) tabNetworkLogs.set(tabId, []);
+
+  const failedOnly = Boolean(args.failedOnly);
+  const filtered = failedOnly ? records.filter((r) => r.status >= 400 || r.status === 0) : records;
+
+  if (!filtered.length) {
+    return { ok: true, text: failedOnly ? "No failed network requests." : "No network activity recorded." };
+  }
+
+  const formatted = filtered.slice(0, 30).map((item) => {
+    const time = new Date(item.timestamp).toLocaleTimeString();
+    const st = item.status === 0 ? "FAIL" : item.status;
+    return `[${time}] ${st} ${item.type || ""} ${item.url} ${item.errorText || item.statusText || ""}`;
+  });
+
+  return { ok: true, text: `Network activity for tab ${tabId} (${filtered.length}):\n${formatted.join("\n")}` };
+}
+
 async function screenshot(args) {
   const tabId = requireTab(args.tabId);
   const tab = await assertTabAllowed(tabId);
   await markGroup(tabId);
-  await chrome.tabs.update(tabId, { active: true });
-  if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
-  await sleep(250);
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 60 });
+  await focusTab(tabId);
+  await sleep(150);
+
+  // Full page screenshot via CDP if requested
+  if (args.fullPage && cdpSessions.has(tabId)) {
+    try {
+      const metrics = await chrome.debugger.sendCommand({ tabId }, "Page.getLayoutMetrics");
+      const width = Math.ceil(metrics.contentSize.width);
+      const height = Math.ceil(metrics.contentSize.height);
+
+      const shot = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+        format: "jpeg",
+        quality: 70,
+        clip: { x: 0, y: 0, width, height, scale: 1 },
+        captureBeyondViewport: true,
+      });
+
+      return {
+        ok: true,
+        text: `Captured full page screenshot of tab ${tabId} (${width}x${height}).`,
+        imageBase64: shot.data,
+        mimeType: "image/jpeg",
+      };
+    } catch (err) {
+      console.warn(`[Agent in Chrome] CDP full page screenshot failed, falling back to viewport: ${err.message}`);
+    }
+  }
+
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 });
   const imageBase64 = String(dataUrl).replace(/^data:image\/jpeg;base64,/, "");
-  return { ok: true, text: `Captured the visible area of tab ${tabId}.`, imageBase64, mimeType: "image/jpeg" };
+  return { ok: true, text: `Captured visible area of tab ${tabId}.`, imageBase64, mimeType: "image/jpeg" };
 }
 
 async function runScript(args) {
@@ -236,7 +699,8 @@ async function runScript(args) {
   await assertTabAllowed(tabId);
   const code = String(args.code || "");
   if (!code.trim()) throw new Error("Missing code.");
-  if (code.length > 20000) throw new Error("Script is too long.");
+  if (code.length > 50000) throw new Error("Script is too long.");
+
   let result;
   try {
     const injected = await chrome.scripting.executeScript({
@@ -252,13 +716,14 @@ async function runScript(args) {
   } catch (error) {
     throw new Error(error instanceof Error ? error.message : String(error));
   }
+
   let text;
   try {
-    text = typeof result === "string" ? result : JSON.stringify(result);
+    text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
   } catch {
     text = String(result);
   }
-  return { ok: true, text: text === undefined ? "Script finished." : text.slice(0, 12000) };
+  return { ok: true, text: text === undefined ? "Script finished." : text.slice(0, 20000) };
 }
 
 async function assertTabAllowed(tabId) {
@@ -284,18 +749,48 @@ async function ensureHttpAllowed(url) {
   await ensureAllowed(parsed.origin);
 }
 
+// Sensitive domain protection (banking, high-risk financial sites)
+const SENSITIVE_DOMAINS = [
+  "bankofamerica.com",
+  "chase.com",
+  "wellsfargo.com",
+  "citi.com",
+  "fidelity.com",
+  "vanguard.com",
+  "schwab.com",
+  "coinbase.com",
+  "binance.com",
+  "kraken.com",
+  "1password.com",
+  "bitwarden.com",
+  "lastpass.com",
+];
+
 async function ensureAllowed(origin) {
   const stored = await chrome.storage.local.get(["allowAll", "allowedOrigins"]);
+
+  // Detect sensitive domains
+  const host = new URL(origin).hostname.toLowerCase();
+  const isSensitive = SENSITIVE_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+  if (isSensitive && !stored.allowedOrigins?.includes(origin)) {
+    const granted = await requestGrant(origin, true);
+    if (!granted) {
+      throw new Error(`High-risk sensitive site blocked for safety: ${origin}. You must explicitly approve this site in the side panel.`);
+    }
+    return;
+  }
+
   if (stored.allowAll) return;
   const allowed = stored.allowedOrigins || [];
   if (allowed.includes(origin)) return;
-  const granted = await requestGrant(origin);
+
+  const granted = await requestGrant(origin, false);
   if (!granted) {
-    throw new Error(`Site not allowed: ${origin}. Click the Grok in Chrome icon and choose Allow for this site.`);
+    throw new Error(`Site not allowed: ${origin}. Click the Agent in Chrome icon and choose Allow for this site.`);
   }
 }
 
-function requestGrant(origin) {
+function requestGrant(origin, isHighRisk = false) {
   const existing = pendingGrants.get(origin);
   if (existing) return existing.promise;
   let finish = () => {};
@@ -312,8 +807,8 @@ function requestGrant(origin) {
   });
   pendingGrants.set(origin, { promise, finish });
   chrome.action.setBadgeText({ text: "!" });
-  chrome.action.setBadgeBackgroundColor({ color: "#b5483d" });
-  chrome.storage.local.set({ pendingOrigin: origin });
+  chrome.action.setBadgeBackgroundColor({ color: isHighRisk ? "#dc2626" : "#2563eb" });
+  chrome.storage.local.set({ pendingOrigin: origin, pendingHighRisk: isHighRisk });
   chrome.windows.getCurrent().then((window) => {
     if (window?.id != null) chrome.sidePanel.open({ windowId: window.id }).catch(() => {});
   }).catch(() => {});
@@ -358,23 +853,23 @@ async function sendToPage(tabId, payload) {
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
-    await sleep(200);
+    await sleep(150);
   }
-  throw new Error(`Could not reach the page. ${lastError}`.trim());
+  throw new Error(`Could not reach page: ${lastError}`.trim());
 }
 
 function waitForNavigation(tabId, url) {
   const expected = url.split("#")[0];
   return new Promise((resolve) => {
     let sawLoad = false;
-    const timer = setTimeout(() => finish("timeout"), 20000);
+    const timer = setTimeout(() => finish("timeout"), 25000);
     const poll = setInterval(() => {
       chrome.tabs.get(tabId).then((tab) => {
         if (tab.status === "complete" && tab.url && tab.url.split("#")[0].startsWith(expected.slice(0, Math.min(expected.length, 180)))) {
-          if (sawLoad || Date.now() > started + 400) finish("complete");
+          if (sawLoad || Date.now() > started + 300) finish("complete");
         }
       }).catch(() => finish("missing"));
-    }, 200);
+    }, 150);
     const started = Date.now();
     function finish() {
       clearTimeout(timer);
@@ -394,23 +889,21 @@ function waitForNavigation(tabId, url) {
 async function markGroup(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
-    const groups = await chrome.tabGroups.query({ title: "Grok", windowId: tab.windowId });
+    const groups = await chrome.tabGroups.query({ title: "Agent", windowId: tab.windowId });
     if (groups[0]) {
       await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id });
     } else {
       const groupId = await chrome.tabs.group({ tabIds: [tabId] });
-      await chrome.tabGroups.update(groupId, { title: "Grok", color: "blue" });
+      await chrome.tabGroups.update(groupId, { title: "Agent", color: "blue" });
     }
-  } catch {
-    // Grouping is a hint. The tab still exists if the browser refuses it.
-  }
+  } catch {}
 }
 
 async function logActivity(tool, detail) {
   const stored = await chrome.storage.local.get(["activity"]);
   const activity = stored.activity || [];
   activity.unshift({ t: Date.now(), tool: tool || "tool", detail: String(detail || "").slice(0, 180) });
-  await chrome.storage.local.set({ activity: activity.slice(0, 30) });
+  await chrome.storage.local.set({ activity: activity.slice(0, 40) });
 }
 
 function summarize(tool, args) {
@@ -419,17 +912,21 @@ function summarize(tool, args) {
     return `filled ${count} field${count === 1 ? "" : "s"} on tab ${args.tabId}`;
   }
   if (tool === "type_text") return `typed on tab ${args.tabId}`;
-  if (tool === "navigate") return `opened ${args.url} in tab ${args.tabId}`;
-  if (tool === "tabs_create") return `opened ${args.url || "a blank tab"}`;
-  if (tool === "click") return `clicked ${args.ref || args.selector || "an element"} on tab ${args.tabId}`;
+  if (tool === "navigate") return `navigated tab ${args.tabId} to ${args.url}`;
+  if (tool === "tabs_create") return `opened ${args.url || "blank tab"}`;
+  if (tool === "click") return `clicked ${args.ref || args.selector || "element"} on tab ${args.tabId}`;
   if (tool === "screenshot") return `captured tab ${args.tabId}`;
-  if (tool === "run_script") return `ran a script on tab ${args.tabId}`;
+  if (tool === "upload_file") return `uploaded file to tab ${args.tabId}`;
+  if (tool === "handle_dialog") return `handled dialog on tab ${args.tabId}`;
+  if (tool === "get_console_logs") return `read console logs on tab ${args.tabId}`;
+  if (tool === "get_network_activity") return `read network activity on tab ${args.tabId}`;
+  if (tool === "run_script") return `ran script on tab ${args.tabId}`;
   return `${tool} on tab ${args.tabId ?? ""}`.trim();
 }
 
 function requireTab(tabId) {
   if (typeof tabId !== "number" || !Number.isFinite(tabId)) {
-    throw new Error("Missing tabId. Call tabs_context or tabs_create, then pass that tab id.");
+    throw new Error("Missing tabId. Call tabs_context or tabs_create first to get a tabId.");
   }
   return tabId;
 }

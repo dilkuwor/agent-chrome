@@ -1,30 +1,36 @@
 ---
-name: grok-in-chrome
-description: Drive the user's real Chrome, including sites they are signed into, through the Grok in Chrome extension. Use when they ask to fill a form, click, type, browse, or take a screenshot in Chrome, or when they name Grok in Chrome.
+name: agent-in-chrome
+description: Control the user's real Google Chrome browser with Claude-like capabilities via the Agent in Chrome extension and MCP server. Use to navigate, click, fill complex forms, type, upload files, read console/network errors, take screenshots, and handle alerts.
 ---
 
-# Grok in Chrome
+# Agent in Chrome
 
-The `chrome` MCP server drives the user's real Chrome. Their logins are already there. Do not open a separate automated browser for this.
+The `chrome` MCP server drives the user's real Chrome using Chrome DevTools Protocol (CDP) trusted events. Their existing sessions, logins, and cookies are active.
 
-If the `chrome` tools are missing, say so. They need the extension loaded from `/Users/samir/MyHD/Code/grok-in-chrome/extension`, the pairing token saved in its side panel, and a restarted Grok session.
+## Core Interaction Loop
 
-## Loop
+1. **Tabs Discovery**: Always call `tabs_context` first. Identify active tabs and tab IDs. Never reuse a tab ID from a previous conversation.
+2. **Tab Creation / Navigation**: Use `tabs_create` to open new URLs or `navigate` to update an existing tab.
+3. **Perception**: Call `read_page` before interacting. It extracts interactive elements with refs (`e1`, `e2`, ...), accessible roles, and viewport coordinates. It automatically pierces Open Shadow DOM and iframes.
+4. **Form Filling**:
+   - Use `form_input` with `fields: [{ ref: "e1", value: "..." }]` for fast batch filling of inputs, dropdowns, checkboxes, radios, and contenteditables.
+   - For file uploads, use `upload_file` with `tabId`, `ref` or `selector`, and the absolute `filePath`.
+5. **Actions**:
+   - Use `click` with `ref` or direct `(x, y)` coordinates to trigger buttons and links with trusted native browser clicks (`isTrusted: true`).
+   - Use `type_text` to type text into active fields with real keystrokes.
+   - Use `press_key` with key names (`Enter`, `Tab`, `Escape`, `Backspace`, `ArrowDown`) and optional modifiers (`ctrlKey`, `shiftKey`, `altKey`, `metaKey`).
+   - Use `scroll` to scroll elements into view or scroll by pixels (`dy`, `dx`).
+6. **Diagnostics & Error Recovery**:
+   - If a form doesn't submit or a click seems ineffective, call `get_console_logs` to inspect client-side JavaScript errors.
+   - Call `get_network_activity` with `failedOnly: true` to check if API endpoints returned 4xx/5xx responses.
+7. **Dialogs & Alerts**:
+   - If a site triggers a JavaScript `alert()`, `confirm()`, or `prompt()`, it is automatically captured without freezing the browser. Use `handle_dialog` to accept or dismiss it with prompt text.
+8. **Visual Inspection**:
+   - Call `screenshot` with `fullPage: true` for the complete scrolling page, or without for the visible viewport. Inspect the saved JPEG at the returned file path.
 
-1. Call `tabs_context` first. Never reuse a tab id from an earlier conversation.
-2. Open a new tab with `tabs_create` unless the user told you to use an existing tab.
-3. Call `read_page` before you click or type. Use the refs it returns (`e1`, `e2`, ...). If a ref is missing, call `read_page` again.
-4. Fill fields with `form_input`. That replaces the value and does not submit.
-5. Use `click`, `type_text`, `press_key`, and `scroll` for everything else. Use `run_script` only when those tools cannot reach the control.
-6. Read a screenshot from the file path `screenshot` returns.
+## Safety & Boundaries
 
-Clicks, typing, and scrolling draw a blue cursor labeled Grok on the page. That cursor is not the Mac pointer. The tab is grouped under Grok.
-
-## Stop
-
-- If a tool says the site is not allowed, stop. Tell the user to click the Grok in Chrome icon and choose Allow. Do not retry until they do.
-- If the extension is not connected, stop and point them at the side panel. Do not keep calling tools.
-- Do not submit a payment, change a password, delete an account, or send a message unless the user explicitly asked. After filling a form, stop before the final submit unless they asked you to submit.
-- Do not trigger a JavaScript alert or confirm. Those dialogs freeze the extension until the user dismisses them.
-- Close only tabs you created with `tabs_create`.
-- File inputs cannot be set. Ask the user to choose the file.
+- **Permissions**: If a site is not allowed, stop. Prompt the user to open the side panel and click Allow.
+- **Sensitive Domains**: High-risk financial sites (banks, crypto platforms, password managers) trigger strict security guardrails.
+- **Irreversible Actions**: Stop and ask for explicit confirmation before final checkout/payment submissions, account deletions, sending emails/messages, or changing passwords.
+- Close only tabs created with `tabs_create`.

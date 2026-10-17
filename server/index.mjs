@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// MCP server for the Grok in Chrome extension.
-// stdout is the MCP channel. Logs go to stderr only.
+// MCP server for the Agent in Chrome extension.
+// Communicates with MCP clients via JSON-RPC stdio. Logs go to stderr only.
 
 import http from "node:http";
 import fs from "node:fs";
@@ -9,47 +9,65 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 const HOST = "127.0.0.1";
-const PORT = Number(process.env.GROK_CHROME_PORT || 47321);
-const HOME = process.env.GROK_CHROME_HOME || path.join(os.homedir(), ".grok-in-chrome");
+const PORT = Number(process.env.AGENT_CHROME_PORT || process.env.GROK_CHROME_PORT || 47321);
+
+function resolveHome() {
+  if (process.env.AGENT_CHROME_HOME) return process.env.AGENT_CHROME_HOME;
+  if (process.env.GROK_CHROME_HOME) return process.env.GROK_CHROME_HOME;
+  const standardHome = path.join(os.homedir(), ".agent-chrome");
+  if (fs.existsSync(standardHome)) return standardHome;
+  const altHome = path.join(os.homedir(), ".agent-in-chrome");
+  if (fs.existsSync(altHome)) return altHome;
+  const legacyHome = path.join(os.homedir(), ".grok-in-chrome");
+  if (fs.existsSync(legacyHome)) return legacyHome;
+  return standardHome;
+}
+
+const HOME = resolveHome();
 const TOKEN_PATH = path.join(HOME, "token");
 const SHOT_DIR = path.join(HOME, "shots");
-const TIMEOUT_MS = Number(process.env.GROK_CHROME_TIMEOUT_MS || 120000);
-const IDLE_MS = 8000;
+const TIMEOUT_MS = Number(process.env.AGENT_CHROME_TIMEOUT_MS || process.env.GROK_CHROME_TIMEOUT_MS || 120000);
+const IDLE_MS = 12000;
 
-const INSTRUCTIONS = `You control the user's real Chrome through the Grok in Chrome extension. Existing logins are already in that browser.
+const INSTRUCTIONS = `You control the user's Google Chrome browser through the Agent in Chrome extension.
+The browser contains their active logins, cookies, and extensions.
 
-Start with tabs_context. Open a new tab with tabs_create unless the user told you to use an existing tab. Never reuse a tab id from an earlier conversation.
+Loop & Workflow:
+1. Call tabs_context first to discover open tabs and active tab IDs. Do not reuse tab IDs from previous sessions.
+2. Use tabs_create to open target websites or navigate existing tabs.
+3. Call read_page to get interactive elements with refs (e1, e2, ...), accessibility roles, and bounding coordinates.
+4. Fill forms using form_input for text, select dropdowns, checkboxes, and radio buttons.
+5. Use click to trigger buttons and links with trusted native browser clicks.
+6. Use type_text for input fields and press_key for Enter, Tab, Escape, and arrow keys.
+7. Use upload_file for <input type="file"> to upload local files directly.
+8. If an action seems to fail or a form won't submit, call get_console_logs and get_network_activity to diagnose errors.
+9. If a browser alert, confirm, or prompt appears, inspect or dismiss it using handle_dialog.
+10. Use screenshot (with optional fullPage: true) to inspect visual layouts.
 
-Before clicking or typing, call read_page and use the refs it returns (e1, e2, ...). If a ref is missing, call read_page again.
-
-If a tool says a site is not allowed, stop and tell the user to click the Grok in Chrome icon and choose Allow. Do not keep retrying.
-
-Do not submit a payment, change a password, delete an account, or send a message unless the user explicitly asked. After filling a form, stop before the final submit unless they asked you to submit.
-
-Avoid actions that open a JavaScript alert or confirm dialog. Those dialogs freeze the extension until the user dismisses them.
-
-Close only tabs you created. Screenshot files are saved on disk; read the file path the tool returns.`;
+Safety:
+- Do not execute financial transactions, checkout purchases, password changes, or account deletions without explicit user confirmation.
+- Respect sensitive site warnings.`;
 
 const TOOLS = [
   {
     name: "tabs_context",
-    description: "List open Chrome tabs (id, window, title, url). Call this first. Do not reuse tab ids from an earlier conversation.",
+    description: "List all open Chrome tabs (id, window, title, url, active status, group). Call this first.",
     schema: { type: "object", properties: {} },
   },
   {
     name: "tabs_create",
-    description: "Open a new tab. Pass url to go there immediately. The site must be allowed in the extension, or the user is asked to allow it. The new tab is grouped under Grok.",
+    description: "Open a new Chrome tab. Pass url to navigate immediately. Tab is grouped under Agent.",
     schema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "http(s) URL. Omit to open a blank tab." },
-        active: { type: "boolean", description: "Focus the tab. Default true." },
+        url: { type: "string", description: "http(s) URL. Omit for blank tab." },
+        active: { type: "boolean", description: "Focus tab immediately. Default true." },
       },
     },
   },
   {
     name: "tabs_close",
-    description: "Close a tab. Close only tabs you created with tabs_create.",
+    description: "Close a Chrome tab by tabId.",
     schema: {
       type: "object",
       properties: { tabId: { type: "number" } },
@@ -59,7 +77,7 @@ const TOOLS = [
   },
   {
     name: "navigate",
-    description: "Go to a URL in an existing tab and wait for it to load. The site must be allowed, or the user is asked to allow it.",
+    description: "Navigate an existing tab to a URL and wait for page load.",
     schema: {
       type: "object",
       properties: {
@@ -72,7 +90,7 @@ const TOOLS = [
   },
   {
     name: "read_page",
-    description: "List interactive elements on a tab with refs like e1, e2. Call this before form_input, click, or type_text. The site must be allowed.",
+    description: "Inspect the page and list interactive elements with refs like e1, e2, roles, bounding boxes, and viewport visibility. Supports Open Shadow DOM and iframes.",
     schema: {
       type: "object",
       properties: { tabId: { type: "number" } },
@@ -82,7 +100,7 @@ const TOOLS = [
   },
   {
     name: "get_page_text",
-    description: "Read the visible text of a tab. The site must be allowed.",
+    description: "Extract the full visible text content of the tab.",
     schema: {
       type: "object",
       properties: { tabId: { type: "number" } },
@@ -92,7 +110,7 @@ const TOOLS = [
   },
   {
     name: "form_input",
-    description: "Fill form fields. Pass tabId and fields: [{ref, value}]. A single ref and value also works. Refs come from read_page. This replaces the field value and does not submit the form. File inputs cannot be set. The site must be allowed.",
+    description: "Fill form fields efficiently without artificial delay. Supports text, select dropdowns, checkboxes, radios, and contenteditables. Pass tabId and fields: [{ref, value}] or a single ref/selector and value.",
     schema: {
       type: "object",
       properties: {
@@ -119,13 +137,15 @@ const TOOLS = [
   },
   {
     name: "click",
-    description: "Click an element by ref from read_page, or by CSS selector. The site must be allowed.",
+    description: "Click an element by ref (e1), CSS selector, or direct (x, y) coordinates using trusted native CDP events.",
     schema: {
       type: "object",
       properties: {
         tabId: { type: "number" },
         ref: { type: "string" },
         selector: { type: "string" },
+        x: { type: "number", description: "Viewport X coordinate" },
+        y: { type: "number", description: "Viewport Y coordinate" },
       },
       required: ["tabId"],
     },
@@ -133,7 +153,7 @@ const TOOLS = [
   },
   {
     name: "type_text",
-    description: "Type text into an element by ref or selector. Pass clear:true to replace existing text. Does not submit. The site must be allowed.",
+    description: "Type text into an element using trusted native keystrokes. Pass clear: true to replace existing content.",
     schema: {
       type: "object",
       properties: {
@@ -141,7 +161,7 @@ const TOOLS = [
         ref: { type: "string" },
         selector: { type: "string" },
         text: { type: "string" },
-        clear: { type: "boolean" },
+        clear: { type: "boolean", description: "Clear field before typing" },
       },
       required: ["tabId", "text"],
     },
@@ -149,27 +169,47 @@ const TOOLS = [
   },
   {
     name: "press_key",
-    description: "Press a key in a tab, such as Enter, Tab, or Escape. The site must be allowed.",
+    description: "Press a key (e.g. Enter, Tab, Escape, Backspace, ArrowDown) with optional modifiers (ctrlKey, shiftKey, altKey, metaKey).",
     schema: {
       type: "object",
       properties: {
         tabId: { type: "number" },
         key: { type: "string" },
-        ref: { type: "string", description: "Focus this element first." },
+        ref: { type: "string", description: "Focus this element first" },
+        ctrlKey: { type: "boolean" },
+        shiftKey: { type: "boolean" },
+        altKey: { type: "boolean" },
+        metaKey: { type: "boolean" },
       },
       required: ["tabId", "key"],
     },
     required: ["tabId", "key"],
   },
   {
+    name: "upload_file",
+    description: "Upload a local file to a file input element (<input type=\"file\">) using CDP DOM.setFileInputFiles.",
+    schema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number" },
+        filePath: { type: "string", description: "Absolute path to the file on local disk" },
+        ref: { type: "string" },
+        selector: { type: "string" },
+      },
+      required: ["tabId", "filePath"],
+    },
+    required: ["tabId", "filePath"],
+  },
+  {
     name: "scroll",
-    description: "Scroll a tab by dy pixels, or scroll a ref into view. The site must be allowed.",
+    description: "Scroll the page by dy pixels, or scroll a specific element ref into view.",
     schema: {
       type: "object",
       properties: {
         tabId: { type: "number" },
         ref: { type: "string" },
-        dy: { type: "number" },
+        dy: { type: "number", description: "Vertical scroll pixels (positive down, negative up)" },
+        dx: { type: "number", description: "Horizontal scroll pixels" },
       },
       required: ["tabId"],
     },
@@ -177,22 +217,66 @@ const TOOLS = [
   },
   {
     name: "screenshot",
-    description: "Capture the visible area of a tab, focus that window, and save a JPEG. The result includes a file path. The site must be allowed.",
+    description: "Capture the visible tab or full scrolling page. Saves JPEG to disk and returns file path.",
     schema: {
       type: "object",
-      properties: { tabId: { type: "number" } },
+      properties: {
+        tabId: { type: "number" },
+        fullPage: { type: "boolean", description: "Capture the full height of the page" },
+      },
+      required: ["tabId"],
+    },
+    required: ["tabId"],
+  },
+  {
+    name: "handle_dialog",
+    description: "Accept or dismiss a JavaScript alert, confirm, or prompt dialog, with optional prompt text.",
+    schema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number" },
+        accept: { type: "boolean", description: "True to accept/OK, false to dismiss/Cancel. Default true." },
+        promptText: { type: "string", description: "Text response for prompt dialogs" },
+      },
+      required: ["tabId"],
+    },
+    required: ["tabId"],
+  },
+  {
+    name: "get_console_logs",
+    description: "Retrieve recent browser console logs, warnings, and uncaught exceptions to diagnose client-side errors.",
+    schema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number" },
+        clear: { type: "boolean", description: "Clear log buffer after reading" },
+      },
+      required: ["tabId"],
+    },
+    required: ["tabId"],
+  },
+  {
+    name: "get_network_activity",
+    description: "Retrieve recent network activity and API calls. Set failedOnly: true to isolate HTTP 4xx/5xx errors.",
+    schema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number" },
+        failedOnly: { type: "boolean", description: "Show only failed requests" },
+        clear: { type: "boolean", description: "Clear network buffer after reading" },
+      },
       required: ["tabId"],
     },
     required: ["tabId"],
   },
   {
     name: "run_script",
-    description: "Run a JavaScript function body in the page. Use this only when read_page, click, and form_input cannot do the job. The script may return a JSON value. The site must be allowed.",
+    description: "Execute a JavaScript snippet in the page context. Use return to send a value back.",
     schema: {
       type: "object",
       properties: {
         tabId: { type: "number" },
-        code: { type: "string", description: "Function body. Use return to send a value back." },
+        code: { type: "string", description: "JavaScript function body" },
       },
       required: ["tabId", "code"],
     },
@@ -200,10 +284,10 @@ const TOOLS = [
   },
 ];
 
-const toolMap = new Map(TOOLS.map((tool) => [tool.name, tool]));
+const toolMap = new Map(TOOLS.map((t) => [t.name, t]));
 
 function log(message) {
-  console.error(`[grok-in-chrome] ${message}`);
+  console.error(`[agent-in-chrome] ${message}`);
 }
 
 function loadToken() {
@@ -245,7 +329,7 @@ function textResult(text, isError = false) {
 }
 
 function extensionDownMessage() {
-  return "Chrome extension is not connected. In Chrome, open chrome://extensions, turn on Developer mode, Load unpacked, and choose the extension folder. Then click the Grok in Chrome icon and paste the pairing token from ~/.grok-in-chrome/token.";
+  return "Chrome extension is not connected. Open chrome://extensions in Chrome, ensure Developer mode is ON, and Load unpacked the extension directory. Open the side panel and ensure pairing token is configured.";
 }
 
 function notePoll() {
@@ -273,6 +357,7 @@ function enqueue(tool, args) {
     }, TIMEOUT_MS);
     pending.set(id, { resolve, reject, timer });
   });
+
   if (pollWaiter) {
     const waiter = pollWaiter;
     pollWaiter = null;
@@ -314,7 +399,7 @@ function saveShot(imageBase64) {
   const file = path.join(SHOT_DIR, `shot-${Date.now()}.jpg`);
   fs.writeFileSync(file, Buffer.from(imageBase64, "base64"));
   const files = fs.readdirSync(SHOT_DIR).filter((name) => name.startsWith("shot-")).sort();
-  for (const old of files.slice(0, Math.max(0, files.length - 10))) {
+  for (const old of files.slice(0, Math.max(0, files.length - 15))) {
     fs.rmSync(path.join(SHOT_DIR, old), { force: true });
   }
   return file;
@@ -330,7 +415,7 @@ function toMcp(result) {
       const file = saveShot(result.imageBase64);
       text = `${text}\nScreenshot file: ${file}`;
     } catch (error) {
-      text = `${text}\nCould not save the screenshot: ${error.message}`;
+      text = `${text}\nCould not save screenshot: ${error.message}`;
     }
   }
   return textResult(text, false);
@@ -342,7 +427,7 @@ async function callTool(name, args) {
   const input = args || {};
   for (const key of tool.required || []) {
     if (input[key] == null || input[key] === "") {
-      return textResult(`Missing ${key}.`, true);
+      return textResult(`Missing required parameter: ${key}.`, true);
     }
   }
   log(`tool ${name}`);
@@ -354,10 +439,10 @@ async function callTool(name, args) {
 }
 
 function toolList() {
-  return TOOLS.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.schema,
+  return TOOLS.map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: t.schema,
   }));
 }
 
@@ -374,7 +459,7 @@ async function handleRpc(message) {
       result: {
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "grok-in-chrome", version: "0.1.0" },
+        serverInfo: { name: "agent-in-chrome", version: "0.2.0" },
         instructions: INSTRUCTIONS,
       },
     });
@@ -441,7 +526,6 @@ function pullMessage() {
   const newline = buffer.indexOf("\n");
   if (newline < 0) return null;
   buffer = buffer.slice(newline + 1);
-  log("skipped unexpected stdin");
   return pullMessage();
 }
 
@@ -473,13 +557,20 @@ function authorized(req) {
   return req.headers.authorization === `Bearer ${token}`;
 }
 
+function isOriginAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // Local curl or direct background fetch
+  // Only allow Chrome extension origins or localhost
+  return origin.startsWith("chrome-extension://") || origin.startsWith("http://127.0.0.1:") || origin.startsWith("http://localhost:");
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 15_000_000) {
+      if (size > 20_000_000) {
         reject(new Error("body too large"));
         req.destroy();
         return;
@@ -491,60 +582,69 @@ function readBody(req) {
   });
 }
 
-function reply(res, status, payload) {
+function reply(res, status, payload, reqOrigin = "") {
   const body = JSON.stringify(payload);
-  res.writeHead(status, {
+  const headers = {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": reqOrigin || "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
     "Access-Control-Allow-Headers": "content-type, authorization",
     "Access-Control-Allow-Private-Network": "true",
-  });
+  };
+  res.writeHead(status, headers);
   res.end(body);
 }
 
 async function handleHttp(req, res) {
-  if (process.env.GROK_CHROME_DEBUG) log(`${req.method} ${req.url}`);
+  const reqOrigin = req.headers.origin || "";
+
   if (req.method === "OPTIONS") {
-    reply(res, 204, {});
+    reply(res, 204, {}, reqOrigin);
     return;
   }
+
+  if (!isOriginAllowed(req)) {
+    reply(res, 403, { error: "forbidden origin" });
+    return;
+  }
+
   const url = new URL(req.url || "/", `http://${HOST}`);
 
   if (req.method === "GET" && url.pathname === "/health") {
-    reply(res, 200, { ok: true, connected: extensionIsConnected() });
+    reply(res, 200, { ok: true, connected: extensionIsConnected() }, reqOrigin);
     return;
   }
 
   if (!authorized(req)) {
-    reply(res, 401, { error: "bad token" });
+    reply(res, 401, { error: "bad token" }, reqOrigin);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/poll") {
     const job = await takeJob();
-    reply(res, 200, job ? { job } : { timeout: true });
+    reply(res, 200, job ? { job } : { timeout: true }, reqOrigin);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/result") {
     const body = JSON.parse((await readBody(req)) || "{}");
     if (!finishJob(body.id, body.result)) {
-      reply(res, 404, { error: "unknown id" });
+      reply(res, 404, { error: "unknown job id" }, reqOrigin);
       return;
     }
-    reply(res, 200, { ok: true });
+    reply(res, 200, { ok: true }, reqOrigin);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/call") {
     const body = JSON.parse((await readBody(req)) || "{}");
     const result = await callTool(body.tool, body.args || {});
-    reply(res, 200, { result });
+    reply(res, 200, { result }, reqOrigin);
     return;
   }
 
-  reply(res, 404, { error: "not found" });
+  reply(res, 404, { error: "not found" }, reqOrigin);
 }
 
 function startProxy() {
@@ -576,13 +676,13 @@ async function proxyCall(name, args) {
     body: JSON.stringify({ tool: name, args: args || {} }),
   });
   if (response.status === 401) {
-    return textResult("Pairing token was rejected by the running Chrome bridge.", true);
+    return textResult("Pairing token rejected by running bridge.", true);
   }
   if (!response.ok) {
     return textResult(`Chrome bridge returned HTTP ${response.status}.`, true);
   }
   const payload = await response.json();
-  return payload.result || textResult("Chrome bridge returned an empty result.", true);
+  return payload.result || textResult("Empty response from Chrome bridge.", true);
 }
 
 async function handleProxyRpc(message) {
@@ -595,7 +695,7 @@ async function handleProxyRpc(message) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "grok-in-chrome", version: "0.1.0" },
+        serverInfo: { name: "agent-in-chrome", version: "0.2.0" },
         instructions: INSTRUCTIONS,
       },
     });
@@ -617,7 +717,7 @@ async function handleProxyRpc(message) {
       proxySend({
         jsonrpc: "2.0",
         id,
-        result: textResult(`Could not reach the Chrome bridge on ${HOST}:${PORT}. ${error.message}`, true),
+        result: textResult(`Could not reach bridge on ${HOST}:${PORT}: ${error.message}`, true),
       });
     }
     return;
@@ -670,7 +770,7 @@ function onProxyStdin(chunk) {
     try {
       message = pullProxyMessage();
     } catch (error) {
-      log(`bad message: ${error.message}`);
+      log(`bad proxy message: ${error.message}`);
       return;
     }
     if (!message) return;

@@ -90,7 +90,7 @@ try {
     expression: "chrome.runtime.getManifest().name",
     returnByValue: true,
   });
-  if (manifest.result?.value !== "Grok in Chrome") {
+  if (manifest.result?.value !== "Agent in Chrome") {
     throw new Error(`unexpected service worker ${worker.url}: ${JSON.stringify(manifest)}`);
   }
   const stored = await workerCdp.send("Runtime.evaluate", {
