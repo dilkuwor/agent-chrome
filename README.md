@@ -56,14 +56,14 @@ A powerful, Claude-like Chrome extension and Model Context Protocol (MCP) server
 2. Enable **Developer mode** in the top-right corner.
 3. Click **Load unpacked** and select the repository's `extension` directory:
    ```
-   /Users/samir/MyHD/Code/agent-chrome/extension
+   <path-to-agent-chrome>/extension
    ```
 4. Click the puzzle icon in Chrome's toolbar, pin **Agent in Chrome**, and click it to open the side panel.
 
 ### 2. Pairing with the Agent MCP Server
 1. The pairing token is generated automatically on the first server launch, or print it anytime:
    ```bash
-   node /Users/samir/MyHD/Code/agent-chrome/server/index.mjs --print-token
+   node server/index.mjs --print-token
    ```
 2. In the Chrome side panel, paste the token into the **Token** field (or click **File** to choose `~/.agent-chrome/token`), then click **Save**.
 3. When the MCP server runs, the side panel will display a green **Connected** status badge.
@@ -72,14 +72,14 @@ A powerful, Claude-like Chrome extension and Model Context Protocol (MCP) server
 
 #### Antigravity (AGY)
 ```bash
-agy mcp add chrome -- node /Users/samir/MyHD/Code/agent-chrome/server/index.mjs
+agy mcp add chrome -- node <path-to-agent-chrome>/server/index.mjs
 ```
 
 #### Grok (`~/.grok/config.toml`)
 ```toml
 [mcp.servers.chrome]
 command = "node"
-args = ["/Users/samir/MyHD/Code/agent-chrome/server/index.mjs"]
+args = ["<path-to-agent-chrome>/server/index.mjs"]
 ```
 
 #### Claude Desktop (`claude_desktop_config.json`)
@@ -88,7 +88,7 @@ args = ["/Users/samir/MyHD/Code/agent-chrome/server/index.mjs"]
   "mcpServers": {
     "chrome": {
       "command": "node",
-      "args": ["/Users/samir/MyHD/Code/agent-chrome/server/index.mjs"]
+      "args": ["<path-to-agent-chrome>/server/index.mjs"]
     }
   }
 }
@@ -102,8 +102,8 @@ Run the full protocol test suite and browser smoke test:
 
 ```bash
 # 1. MCP Protocol & Tool Tests (Tests all 17 tools and proxy mode)
-node /Users/samir/MyHD/Code/agent-chrome/server/test.mjs
+node server/test.mjs
 
 # 2. Live Browser Smoke Test (Launches headless Chrome/Brave, tests real form fill & click)
-node /Users/samir/MyHD/Code/agent-chrome/server/smoke.mjs
+node server/smoke.mjs
 ```
