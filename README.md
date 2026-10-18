@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="extension/icons/icon.png" width="128" height="128" alt="Agent in Chrome" />
+</p>
+
 # Agent in Chrome
 
 A powerful, Claude-like Chrome extension and Model Context Protocol (MCP) server. AI agents (Grok, AGY, Claude, etc.) can navigate, inspect, click, type, fill complex forms, upload files, read console errors, and control Google Chrome using the logins and sessions already active in your browser.
